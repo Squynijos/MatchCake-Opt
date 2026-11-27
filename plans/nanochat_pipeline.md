@@ -1,6 +1,6 @@
 # Plan: nanochat-style LLM pipeline for fermionic (MatchCake) models
 
-Status: **draft for review**. Comment directly on the lines of this file in the PR.
+Status: **approved** (review answers recorded in section 5).
 
 ## 1. Goal
 
@@ -27,10 +27,10 @@ LR schedule, evaluations, logger, hardware.
 
 | nanochat file | Role | Kept? |
 |---|---|---|
-| `scripts/base_train.py` | step-based pretraining loop: grad accumulation to a token budget, warmup/constant/warmdown LR, Muon momentum + weight-decay schedules, eval every N steps, sampling, checkpoints | **yes**, mapped onto Lightning |
+| `scripts/base_train.py` | step-based pretraining loop: grad accumulation to a token budget, warmup/constant/warmdown LR, eval every N steps, sampling, checkpoints | **yes**, mapped onto Lightning |
 | `nanochat/dataloader.py`, `dataset.py` | parquet shards (ClimbMix), BOS-aligned best-fit packing, DDP sharding, approximate resume | **yes** |
 | `nanochat/loss_eval.py` | bits per byte (tokenizer-independent loss) | **yes** |
-| `nanochat/optim.py` | `MuonAdamW` (Muon on 2D matrices, AdamW elsewhere, ZeRO-2 sharding) | **yes**, as one optimizer option |
+| `nanochat/optim.py` | `MuonAdamW` (Muon on 2D matrices, AdamW elsewhere, ZeRO-2 sharding) | **no**: AdamW (any `torch.optim` class from the config) |
 | `nanochat/tokenizer.py` | tiktoken/rustbpe tokenizer, chat template rendering with loss mask, `token_bytes` | interface + adapters, **no training** |
 | `scripts/chat_sft.py`, `tasks/*` | SFT on a task mixture (SmolTalk, MMLU aux, GSM8K) with masked targets | **yes** |
 | `scripts/chat_eval.py`, `nanochat/engine.py`, `execution.py` | categorical eval (ARC, MMLU) via answer-letter logits; generative eval (GSM8K, HumanEval) via sampling; sandboxed code execution | **yes**, generation without KV cache by default |
@@ -53,9 +53,9 @@ matchcake_opt CLI  (LightningCLI: fit / validate / test / chat-eval)
    │       └── sources: TextSource / Task    (parquet shards | HF dataset | local files | SmolTalk, MMLU, ...)
    ├── model          : LanguageModel(BaseModel)
    │       └── backbone: any torch.nn.Module  (the user's fermionic model, ids -> logits)
-   ├── optimizer      : AdamW | MuonAdamW | any torch.optim class
+   ├── optimizer      : AdamW (default) | any torch.optim class
    ├── lr_scheduler   : warmup-constant-warmdown | cosine | any
-   ├── callbacks      : sampling, chat eval, Muon schedules, checkpointing
+   ├── callbacks      : sampling, chat eval, checkpointing
    ├── logger         : TensorBoard (default) | Weights & Biases | CSV
    └── trainer        : devices, strategy (ddp), precision, max_steps, val every N steps, ...
 ```
@@ -74,7 +74,7 @@ Optional hooks the pipeline uses **if present** (never required):
 
 | Hook | Used for |
 |---|---|
-| `param_groups(**lrs)` | custom optimizer parameter groups (e.g. which params go to Muon) |
+| `param_groups(**lrs)` | custom optimizer parameter groups (e.g. different LR or weight decay per group) |
 | `generate_step(idx, cache)` | faster incremental generation; otherwise generation recomputes the full sequence each token |
 | `num_flops_per_token()` | MFU / throughput logging |
 
@@ -130,7 +130,6 @@ automatically (config linking, see 3.5).
 | `--sample-every` | `SamplingCallback(every_n_steps, prompts)` → text logged to TensorBoard |
 | `--save-every`, resume | `ModelCheckpoint(every_n_train_steps)` + `ckpt_path=last` (model, optimizer, scheduler, data state) |
 | LR warmup/constant/warmdown | `WarmupWarmdownLR` (`LambdaLR`, `interval: step`) |
-| Muon momentum + cosine weight-decay schedules | `MuonScheduleCallback` |
 | `torchrun` + DDP | `trainer.devices: 8`, `trainer.strategy: ddp` |
 | bf16 autocast, `torch.compile` | `trainer.precision`, `model.compile: true` — both optional (see open question Q3) |
 | wandb `--run` | `trainer.logger` (TensorBoard by default, wandb optional) |
@@ -200,7 +199,8 @@ matchcake-opt chat-eval --config runs/sft_example.yaml --ckpt_path checkpoints/s
 
 ### 3.7 Package layout
 
-New modules follow the existing layout by component type:
+New code follows the existing layout by component type. It goes into an existing file when it fits there
+(e.g. new datasets in `datasets/`, new modules in `modules/`); new files are created only when needed:
 
 ```
 src/matchcake_opt/
@@ -208,11 +208,11 @@ src/matchcake_opt/
   datasets/text/   sources.py (ParquetShards, HFTextDataset, TextFiles), packing.py, download.py
   tasks/           common.py, smoltalk.py, mmlu.py, gsm8k.py, arc.py, humaneval.py, custom_json.py
   datamodules/     pretrain_datamodule.py, sft_datamodule.py
-  modules/         language_model.py
+  modules/         language_model.py, fermionic_lm.py (reference backbone)
   metrics/         bpb.py
-  optim/           muon_adamw.py, schedulers.py
+  optim/           schedulers.py
   generation/      sampling.py, tools.py (calculator), execution.py (sandbox)
-  callbacks/       sampling.py, chat_eval.py, muon_schedule.py
+  callbacks/       sampling.py, chat_eval.py
   evaluation/      chat_eval.py
   cli.py           LightningCLI entrypoint (`matchcake-opt` console script)
 runs/              example configs (pretrain, sft, chat-eval, tiny CPU smoke test)
@@ -238,29 +238,25 @@ Each PR targets `dev` on `Squynijos/MatchCake-Opt`, has tests, and passes black 
 |---|---|---|---|
 | 0 | `docs/nanochat-pipeline-plan` | this plan | – |
 | 1 | `feat/tokenizers` | `Tokenizer` interface, 3 adapters, chat template + loss mask, `token_bytes` | – |
-| 2 | `feat/text-data` | text sources, shard download, BOS best-fit packing, `PretrainDataModule` (DDP/worker sharding, resume state) | 1 |
-| 3 | `feat/language-model` | `LanguageModel`, bpb metric, `WarmupWarmdownLR`, `MuonAdamW` port + schedule callback, generation | 1 |
+| 2 | `feat/text-data` | text sources, ClimbMix shard download, BOS best-fit packing, `PretrainDataModule` (DDP/worker sharding, resume state) | 1 |
+| 3 | `feat/language-model` | `LanguageModel`, bpb metric, `WarmupWarmdownLR`, generation | 1 |
 | 4 | `feat/llm-cli` | LightningCLI entrypoint, config linking (vocab size, grad accumulation), sampling callback, example configs, smoke test → **end-to-end pretraining** | 2, 3 |
-| 5 | `feat/sft` | tasks + mixtures, `SFTDataModule`, `init_from` checkpoint | 4 |
-| 6 | `feat/chat-eval` | categorical + generative eval, calculator tool, sandbox, callback + `chat-eval` command → **end-to-end SFT + eval** | 5 |
-| 7 | `feat/rl` (later) | GRPO-style RL on GSM8K | 6 |
-| 8 | `docs/llm-tutorial` | README section + notebook | 6 |
+| 5 | `feat/fermionic-lm` | minimal fermionic reference backbone built with MatchCake (`modules/fermionic_lm.py`), used by the example configs | 3 |
+| 6 | `feat/sft` | tasks + mixtures, `SFTDataModule`, `init_from` checkpoint | 4 |
+| 7 | `feat/chat-eval` | categorical + generative eval, calculator tool, sandbox, callback + `chat-eval` command → **end-to-end SFT + eval** | 6 |
+| 8 | `feat/rl` (later) | GRPO-style RL on GSM8K | 7 |
+| 9 | `docs/llm-tutorial` | README section + notebook | 7 |
 
-PRs 2 and 3 are independent and can be reviewed in parallel.
+PRs 2 and 3 are independent and can be reviewed in parallel; PR 5 can start as soon as PR 3 is merged.
 
-## 5. Open questions
+## 5. Review decisions
 
-- **Q1 — Layout.** Spread the new code across the existing component folders (3.7), or group it in a single
-  `matchcake_opt/llm/` subpackage?
-- **Q2 — Example model.** Should the repo ship a minimal *fermionic* reference backbone (useful for the
-  example configs and tutorial), or only document the contract and keep a test-only dummy?
-- **Q3 — Precision / compile.** Do MatchCake models work under bf16 autocast and `torch.compile`? Proposed
-  default: `32-true`, no compile; both switchable in the config.
-- **Q4 — Muon.** Muon orthogonalizes 2D weight matrices. If the fermionic model's parameters are mostly
-  rotation angles / small tensors, Muon may not apply. Proposed default: AdamW, with `MuonAdamW` available.
-- **Q5 — Default data.** Default to nanochat's ClimbMix parquet shards (same data as nanochat, so results are
-  comparable with the classical baseline), with HF datasets and local files as alternatives?
-- **Q6 — AutoML.** Should these runs also be launchable through `AutoMLPipeline` (Ax hyperparameter
-  search), or is that out of scope for now?
-- **Q7 — Sequence length.** Fermionic simulation cost grows with sequence length / mode count. Is there a
-  practical upper bound on `seq_len` we should design the defaults around?
+| # | Question | Decision |
+|---|---|---|
+| Q1 | Layout | Use the existing component folders; add to an existing file when it fits, new file only when needed. |
+| Q2 | Example model | Ship a minimal fermionic reference backbone (PR 5). Tests still use a tiny test-only dummy. |
+| Q3 | Precision / compile | Default `precision: 32-true`, no `torch.compile`; both switchable in the config. |
+| Q4 | Optimizer | AdamW. The Muon port is dropped; any `torch.optim` optimizer can be set in the config. |
+| Q5 | Default data | nanochat's ClimbMix parquet shards; HF datasets and local files as alternatives. |
+| Q6 | AutoML | Out of scope for now. Keep it possible: components stay plain constructor arguments (no global state), hyperparameters stay in `init_args`, and the run returns its metrics as a dict like `LightningPipeline.run()`. |
+| Q7 | Sequence length | Unknown. No hard limit in the code: `seq_len` is a config value everywhere, packing and evaluation never assume a minimum, and the example configs use small values (`seq_len: 256`, smoke test `seq_len: 32`). Long-prompt evals (MMLU, HumanEval) truncate prompts from the left to fit `seq_len` and report how many were truncated. |
