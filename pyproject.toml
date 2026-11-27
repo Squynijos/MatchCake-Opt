@@ -32,6 +32,8 @@ dependencies = [
     "matchcake>=0.2.2",
     "medmnist (>=3.0.2,<4.0.0)",
     "torch-geometric>=2.7.0",
+    "tiktoken>=0.11.0",
+    "tokenizers>=0.21.0",
 ]
 dynamic = ["readme"]
 
